@@ -288,6 +288,14 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -395,6 +403,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._history_store = None
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -580,6 +589,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env = with_hermes_node_path()
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
+            extra = self.config.extra if isinstance(getattr(self.config, "extra", None), dict) else {}
+            bridge_env["WHATSAPP_SYNC_FULL_HISTORY"] = (
+                "true" if _coerce_bool(extra.get("sync_full_history"), False) else "false"
+            )
             # Pass the profile-aware cache directories so the bridge writes
             # media where the Python side reads it.  Without these the bridge
             # hardcodes ~/.hermes/{image,audio,document}_cache, which diverges
@@ -776,6 +789,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
         self._http_session = None
+        history_store = getattr(self, "_history_store", None)
+        if history_store is not None:
+            try:
+                history_store.close()
+            except Exception:
+                pass
+            self._history_store = None
 
         self._release_platform_lock()
 
@@ -832,6 +852,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if resp.status == 200:
                         data = await resp.json()
                         last_message_id = data.get("messageId")
+                        if last_message_id:
+                            self._record_whatsapp_agent_message(
+                                chat_id=chat_id,
+                                message_id=last_message_id,
+                            )
                     else:
                         error = await resp.text()
                         return SendResult(success=False, error=error)
@@ -1146,7 +1171,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
-            if not self._should_process_message(data):
+            should_process = self._should_process_message(data)
+            self._record_whatsapp_history(data, was_processed=should_process)
+            if not should_process:
                 return None
 
             # Determine message type
@@ -1173,6 +1200,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 chat_type=chat_type,
                 user_id=data.get("senderId"),
                 user_name=data.get("senderName"),
+                thread_id=self._thread_id_for_whatsapp_reply(data),
+                message_id=data.get("messageId"),
             )
             
             # Download media URLs to the local cache so agent tools
@@ -1233,14 +1262,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if data.get("isGroup"):
                 body = self._clean_bot_mention_text(body, data)
 
-            # If this is a reply, include the quoted message text so the agent
-            # knows exactly what the user is responding to (fixes "approve" context issue)
+            # Preserve quoted text through MessageEvent reply fields so the
+            # shared gateway preprocessing path injects the disambiguating
+            # reply context consistently across platforms.
             quoted_text = str(data.get("quotedText") or "").strip()
             if quoted_text and data.get("hasQuotedMessage"):
                 # Truncate long quoted text to keep prompts reasonable
                 if len(quoted_text) > 300:
                     quoted_text = quoted_text[:297] + "..."
-                body = f"[Replying to: \"{quoted_text}\"]\n{body}"
             MAX_TEXT_INJECT_BYTES = 100 * 1024
             if msg_type == MessageType.DOCUMENT and cached_urls:
                 for doc_path in cached_urls:
@@ -1268,18 +1297,101 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         except Exception as e:
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
-            return MessageEvent(
+            event = MessageEvent(
                 text=body,
                 message_type=msg_type,
                 source=source,
                 raw_message=data,
                 message_id=data.get("messageId"),
+                reply_to_message_id=data.get("quotedMessageId"),
+                reply_to_text=quoted_text or None,
+                reply_to_author_id=data.get("quotedParticipant"),
+                reply_to_is_own_message=self._message_is_reply_to_bot(data),
                 media_urls=cached_urls,
                 media_types=media_types,
             )
+            event.channel_context = self._recent_whatsapp_context(data)
+            return event
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
             return None
+
+    def _get_whatsapp_history_store(self):
+        store = getattr(self, "_history_store", None)
+        if store is None:
+            from gateway.whatsapp_history import WhatsAppHistoryStore
+            store = WhatsAppHistoryStore()
+            self._history_store = store
+        return store
+
+    def _record_whatsapp_history(self, data: Dict[str, Any], *, was_processed: bool) -> None:
+        try:
+            self._get_whatsapp_history_store().record_message(
+                data,
+                was_processed=was_processed,
+            )
+        except Exception:
+            logger.debug("Failed to persist WhatsApp history", exc_info=True)
+
+    def _record_whatsapp_agent_message(self, *, chat_id: str, message_id: str) -> None:
+        try:
+            from gateway.session_context import get_session_env
+
+            thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or message_id
+            self._get_whatsapp_history_store().record_agent_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                session_key=get_session_env("HERMES_SESSION_KEY", ""),
+                thread_id=thread_id,
+            )
+        except Exception:
+            logger.debug("Failed to persist WhatsApp agent message id", exc_info=True)
+
+    def _recent_whatsapp_context(self, data: Dict[str, Any]) -> Optional[str]:
+        chat_id = str(data.get("chatId") or "").strip()
+        if not chat_id:
+            return None
+        try:
+            limit = int(self.config.extra.get("history_recent_limit", 12))
+        except (TypeError, ValueError):
+            limit = 12
+        try:
+            char_limit = int(self.config.extra.get("history_context_char_limit", 6000))
+        except (TypeError, ValueError):
+            char_limit = 6000
+        if limit <= 0 or char_limit <= 0:
+            return None
+        try:
+            return self._get_whatsapp_history_store().format_recent_context(
+                chat_id,
+                limit=limit,
+                char_limit=char_limit,
+                before_message_id=data.get("messageId"),
+            ) or None
+        except Exception:
+            logger.debug("Failed to build WhatsApp recent context", exc_info=True)
+            return None
+
+    def _thread_id_for_whatsapp_reply(self, data: Dict[str, Any]) -> Optional[str]:
+        """Recover the original Hermes thread for replies to agent messages."""
+        if not self._message_is_reply_to_bot(data):
+            return None
+        chat_id = str(data.get("chatId") or "").strip()
+        quoted_id = str(data.get("quotedMessageId") or "").strip()
+        if not chat_id or not quoted_id:
+            return None
+        try:
+            mapped = self._get_whatsapp_history_store().lookup_agent_reply_thread(
+                chat_id=chat_id,
+                message_id=quoted_id,
+            )
+        except Exception:
+            logger.debug("Failed to look up WhatsApp reply thread", exc_info=True)
+            return None
+        if not mapped:
+            return None
+        thread_id = str(mapped.get("thread_id") or "").strip()
+        return thread_id or None
 
 
 # ──────────────────────────────────────────────────────────────────────────

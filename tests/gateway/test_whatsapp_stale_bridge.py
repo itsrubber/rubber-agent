@@ -339,3 +339,29 @@ class TestCacheDirEnvPassthrough:
         assert env["HERMES_IMAGE_CACHE_DIR"] == str(get_image_cache_dir())
         assert env["HERMES_AUDIO_CACHE_DIR"] == str(get_audio_cache_dir())
         assert env["HERMES_DOCUMENT_CACHE_DIR"] == str(get_document_cache_dir())
+        assert env["WHATSAPP_SYNC_FULL_HISTORY"] == "false"
+
+    @pytest.mark.asyncio
+    async def test_bridge_spawn_env_enables_full_history_when_configured(self, tmp_path):
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        adapter.config.extra = {"sync_full_history": True}
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            await adapter.connect()
+
+        env = mock_popen.call_args.kwargs["env"]
+        assert env["WHATSAPP_SYNC_FULL_HISTORY"] == "true"
