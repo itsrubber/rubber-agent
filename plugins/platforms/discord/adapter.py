@@ -1032,6 +1032,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message.author == self._client.user:
                     return
 
+                adapter_self._record_discord_history(message, was_processed=False)
+
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
                 # Allow both default and reply types — replies have a distinct MessageType.
                 if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
@@ -5741,7 +5743,101 @@ class DiscordAdapter(BasePlatformAdapter):
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(event)
         else:
+            self._mark_discord_history_processed(event)
             await self.handle_message(event)
+
+    def _get_discord_history_store(self):
+        store = getattr(self, "_discord_history_store", None)
+        if store is None:
+            from gateway.discord_history import DiscordHistoryStore
+            store = DiscordHistoryStore()
+            self._discord_history_store = store
+        return store
+
+    @staticmethod
+    def _discord_attachment_payload(att: Any) -> Dict[str, Any]:
+        return {
+            "id": str(getattr(att, "id", "") or "") or None,
+            "filename": getattr(att, "filename", None),
+            "url": getattr(att, "url", None),
+            "content_type": getattr(att, "content_type", None),
+            "size": getattr(att, "size", None),
+        }
+
+    def _discord_history_payload_from_message(self, message: DiscordMessage) -> Dict[str, Any]:
+        channel = getattr(message, "channel", None)
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        author = getattr(message, "author", None)
+        is_thread = bool(discord is not None and isinstance(channel, discord.Thread))
+        parent = getattr(channel, "parent", None)
+        parent_id = (
+            getattr(channel, "parent_id", None)
+            or getattr(parent, "id", None)
+            or None
+        )
+        channel_id = str(getattr(channel, "id", "") or "")
+        parent_name = getattr(parent, "name", None)
+        channel_name = getattr(channel, "name", None) or channel_id
+        guild_name = getattr(guild, "name", None)
+
+        attachments = [
+            self._discord_attachment_payload(att)
+            for att in list(getattr(message, "attachments", []) or [])
+        ]
+        if hasattr(message, "message_snapshots") and message.message_snapshots:
+            for snap in message.message_snapshots:
+                for att in list(getattr(snap, "attachments", []) or []):
+                    attachments.append(self._discord_attachment_payload(att))
+
+        raw_json = {
+            "id": str(getattr(message, "id", "") or ""),
+            "type": str(getattr(message, "type", "") or ""),
+            "content": getattr(message, "content", None),
+            "clean_content": getattr(message, "clean_content", None),
+            "channel_id": channel_id,
+            "guild_id": str(getattr(guild, "id", "") or "") or None,
+            "author_id": str(getattr(author, "id", "") or "") or None,
+            "attachments": attachments,
+        }
+
+        return {
+            "message_id": str(getattr(message, "id", "") or ""),
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "guild_id": str(getattr(guild, "id", "") or "") or None,
+            "guild_name": guild_name,
+            "thread_id": channel_id if is_thread else None,
+            "parent_id": str(parent_id) if parent_id else None,
+            "author_id": str(getattr(author, "id", "") or "") or None,
+            "author_name": getattr(author, "name", None),
+            "display_name": getattr(author, "display_name", None) or getattr(author, "global_name", None),
+            "body": getattr(message, "clean_content", None) or getattr(message, "content", "") or "",
+            "timestamp": getattr(message, "created_at", None),
+            "is_bot": bool(getattr(author, "bot", False)),
+            "raw_json": raw_json,
+            "attachments": attachments,
+            "parent_name": parent_name,
+        }
+
+    def _record_discord_history(self, message: DiscordMessage, *, was_processed: bool) -> None:
+        try:
+            self._get_discord_history_store().record_message(
+                self._discord_history_payload_from_message(message),
+                was_processed=was_processed,
+            )
+        except Exception:
+            logger.debug("Failed to persist Discord history", exc_info=True)
+
+    def _mark_discord_history_processed(self, event: MessageEvent) -> None:
+        try:
+            source = getattr(event, "source", None)
+            raw = getattr(event, "raw_message", None)
+            channel_id = str(getattr(getattr(raw, "channel", None), "id", "") or getattr(source, "chat_id", "") or "")
+            message_id = str(getattr(event, "message_id", "") or getattr(raw, "id", "") or "")
+            if channel_id and message_id:
+                self._get_discord_history_store().mark_processed(channel_id, message_id)
+        except Exception:
+            logger.debug("Failed to mark Discord history processed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles Discord client-side splits)
@@ -5814,6 +5910,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # into handle_message → the agent's streaming request,
             # aborting the response the user was waiting on.  The new
             # chunk is handled by the fresh flush task regardless.
+            self._mark_discord_history_processed(event)
             await asyncio.shield(self.handle_message(event))
         except asyncio.CancelledError:
             # Only reached if cancel landed before the pop — the shielded

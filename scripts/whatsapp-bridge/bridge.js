@@ -30,6 +30,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { parseBooleanEnv, shouldForwardInboundMessage } from './policy.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -71,6 +72,10 @@ try {
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+// Best effort: Baileys can request fuller sync during supported sessions, but
+// WhatsApp may still provide only recent synced history rather than complete
+// server-side history.
+const SYNC_FULL_HISTORY = parseBooleanEnv(process.env.WHATSAPP_SYNC_FULL_HISTORY, false);
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -100,7 +105,11 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
+function sendWithTimeout(chatId, payload, options = undefined, timeoutMs = SEND_TIMEOUT_MS) {
+  if (typeof options === 'number') {
+    timeoutMs = options;
+    options = undefined;
+  }
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
@@ -109,9 +118,24 @@ function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
     );
   });
   return enqueueSend(() =>
-    Promise.race([sock.sendMessage(chatId, payload), timeoutPromise])
+    Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
       .finally(() => clearTimeout(timer))
   );
+}
+
+function quotedSendOptions(chatId, replyTo) {
+  const id = String(replyTo || '').trim();
+  if (!id) return undefined;
+  return {
+    quoted: {
+      key: {
+        remoteJid: chatId,
+        id,
+        fromMe: false,
+      },
+      message: { conversation: '' },
+    },
+  };
 }
 
 function formatOutgoingMessage(message) {
@@ -222,7 +246,7 @@ async function startSocket() {
     logger,
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
+    syncFullHistory: SYNC_FULL_HISTORY,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -301,52 +325,48 @@ async function startSocket() {
 
       // Handle fromMe messages based on mode
       if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) continue;
+        if (chatId.includes('status')) continue;
 
-        if (WHATSAPP_MODE === 'bot') {
+        if (WHATSAPP_MODE === 'bot' && !isGroup) {
           // Bot mode: separate number. ALL fromMe are echo-backs of our own replies — skip.
           continue;
         }
 
-        // Self-chat mode: only allow messages in the user's own self-chat
-        // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
-        // AND classic format: 34652029134@s.whatsapp.net
-        // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
-        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const chatNumber = chatId.replace(/@.*/, '');
-        const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
-        if (!isSelfChat) continue;
+        if (!isGroup) {
+          // Self-chat mode: only allow messages in the user's own self-chat
+          // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
+          // AND classic format: 34652029134@s.whatsapp.net
+          // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
+          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const chatNumber = chatId.replace(/@.*/, '');
+          const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+          if (!isSelfChat) continue;
+        }
       }
 
       // Handle !fromMe messages (from other people) based on mode.
-      // Self-chat mode only responds to the user's own messages to
-      // themselves — stranger DMs / group pings must never reach the
-      // Python gateway, otherwise a pairing-code reply fires in response
-      // to arbitrary incoming messages (#8389).
-      if (!msg.key.fromMe) {
-        if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
-        if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
+      // DMs keep the strict self-chat/allowlist behavior that prevents
+      // stranger messages from triggering pairing replies (#8389). Groups are
+      // forwarded for ambient history; Python decides whether to invoke Hermes.
+      if (!shouldForwardInboundMessage({
+        isGroup,
+        fromMe: !!msg.key.fromMe,
+        whatsappMode: WHATSAPP_MODE,
+        senderId,
+        allowedUsers: ALLOWED_USERS,
+        sessionDir: SESSION_DIR,
+        matchesAllowedUser,
+      })) {
+        try {
+          console.log(JSON.stringify({
+            event: 'ignored',
+            reason: WHATSAPP_MODE === 'self-chat' ? 'self_chat_mode_rejects_non_self' : 'allowlist_mismatch',
+            chatId,
+            senderId,
+          }));
+        } catch {}
+        continue;
       }
 
       const messageContent = getMessageContent(msg);
@@ -462,6 +482,7 @@ async function startSocket() {
         senderName: msg.pushName || senderNumber,
         chatName: isGroup ? (chatId.split('@')[0]) : (msg.pushName || senderNumber),
         isGroup,
+        fromMe: !!msg.key.fromMe,
         body,
         hasMedia,
         mediaType,
@@ -539,7 +560,11 @@ app.post('/send', async (req, res) => {
     const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
-      const sent = await sendWithTimeout(chatId, { text: chunks[i] });
+      const sent = await sendWithTimeout(
+        chatId,
+        { text: chunks[i] },
+        i === 0 ? quotedSendOptions(chatId, replyTo) : undefined,
+      );
       trackSentMessageId(sent);
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {

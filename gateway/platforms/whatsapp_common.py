@@ -260,9 +260,27 @@ class WhatsAppBehaviorMixin:
 
     def _message_is_reply_to_bot(self, data: Dict[str, Any]) -> bool:
         quoted_participant = self._normalize_whatsapp_id(data.get("quotedParticipant"))
-        if not quoted_participant:
+        if quoted_participant and quoted_participant in self._bot_ids_from_message(data):
+            return True
+
+        chat_id = str(data.get("chatId") or "").strip()
+        quoted_id = str(data.get("quotedMessageId") or "").strip()
+        if not chat_id or not quoted_id:
             return False
-        return quoted_participant in self._bot_ids_from_message(data)
+        lookup = getattr(self, "_get_whatsapp_history_store", None)
+        if not callable(lookup):
+            return False
+        try:
+            store = lookup()
+            return bool(
+                store.lookup_agent_reply_thread(
+                    chat_id=chat_id,
+                    message_id=quoted_id,
+                )
+            )
+        except Exception:
+            logger.debug("Failed to identify WhatsApp reply target", exc_info=True)
+            return False
 
     def _message_mentions_bot(self, data: Dict[str, Any]) -> bool:
         bot_ids = self._bot_ids_from_message(data)
