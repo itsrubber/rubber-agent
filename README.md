@@ -2,9 +2,14 @@
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
 
-# Hermes Agent ☤
+# Rubber Agent 🐙
+
+**Rubber Agent** is impossibl's custom fork of [Hermes Agent](https://github.com/NousResearch/hermes-agent), adapted for our operational use case: Discord/WhatsApp gateway work, persistent ambient chat history, and founder-facing automation.
+
+The Python package/CLI still uses `hermes-agent` / `hermes` for upstream compatibility. The fork/repo/product name is **Rubber Agent**.
+
 <p align="center">
-  <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
+  <a href="https://github.com/itsrubber/rubber-agent">Rubber Agent</a> | upstream: <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a>
 </p>
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
